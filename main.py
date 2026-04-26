@@ -541,10 +541,15 @@ async def _solve_custom(session: aiohttp.ClientSession) -> Optional[str]:
         return None
 
 
-async def solve_captcha(session: aiohttp.ClientSession) -> Optional[str]:
+async def solve_captcha(session: Optional[aiohttp.ClientSession] = None) -> Optional[str]:
     """
     Custom captcha router.
     CAPTCHA_PROVIDER env var အပေါ်မူတည်ပြီး သင့်တော်တဲ့ provider ကို သုံးတယ်။
+    
+    ⚠️ IMPORTANT: Captcha API call တွေက PROXY ကိုဖြတ်ပြီး မသုံးသင့်ဘူး။
+    Geonode/residential proxy တွေက api.nopecha.com / api.capsolver.com စတဲ့
+    legit API server တွေကို ပိတ်လို့ "Invalid status line" error တက်တယ်။
+    အခု ကိုယ်ပိုင် direct session ကို auto-create လုပ်ပေးတယ်။
     """
     provider = CAPTCHA_PROVIDER
 
@@ -561,10 +566,6 @@ async def solve_captcha(session: aiohttp.ClientSession) -> Optional[str]:
         logger.warning("⚠️ Manual mode ဖြစ်ပေမယ့် token မရှိ - /captcha command နဲ့ ထည့်ပါ")
         return None
 
-    # Custom endpoint
-    if provider == "custom":
-        return await _solve_custom(session)
-
     # Provider routing
     solvers = {
         "capsolver": _solve_capsolver,
@@ -572,14 +573,19 @@ async def solve_captcha(session: aiohttp.ClientSession) -> Optional[str]:
         "anticaptcha": _solve_anticaptcha,
         "anti-captcha": _solve_anticaptcha,
         "nopecha": _solve_nopecha,
+        "custom": _solve_custom,
     }
     solver = solvers.get(provider)
     if not solver:
         logger.error(f"❌ မသိသော CAPTCHA_PROVIDER: {provider}")
         return None
 
-    logger.info(f"🧩 Solving {CAPTCHA_TYPE} via {provider}...")
-    return await solver(session)
+    logger.info(f"🧩 Solving {CAPTCHA_TYPE} via {provider}... (direct, no proxy)")
+
+    # ✅ Always use a FRESH proxy-free session for captcha API calls
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as direct_session:
+        return await solver(direct_session)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -619,7 +625,8 @@ async def create_spotify_account(
         ) as session:
 
             # 1️⃣  Solve captcha
-            captcha_token = await solve_captcha(session)
+            # ⚠️ solve_captcha() က proxy-free session ကို auto-create လုပ်တယ်
+            captcha_token = await solve_captcha()
 
             # 2️⃣  Build signup payload
             payload = {
@@ -1315,7 +1322,7 @@ async def cc_setkey_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "anticaptcha": "🟣 AntiCaptcha",
     }
     example_map = {
-        "nopecha": "<code>sub_1TQNBjCRwBwvt6ptQ8sTiOLO</code>\n(NopeCha က subscription ID ကို API key အဖြစ်သုံးတယ်)",
+        "nopecha": "<code>sub_1T</code>\n(NopeCha က subscription ID ကို API key အဖြစ်သုံးတယ်)",
         "capsolver": "<code>CAP-XXXXXXXXXXXXXXXXXXXXXXXX</code>",
         "2captcha": "<code>32-char hex string</code>",
         "anticaptcha": "<code>32-char hex string</code>",
