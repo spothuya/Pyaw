@@ -49,7 +49,6 @@ from telegram.ext import (
 # ⚙️  CONFIGURATION  - ဒီနေရာမှာ Token / API Key တွေထည့်ပါ
 # ════════════════════════════════════════════════════════════════
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8737475995:AAEGXZx_5JadptQwTAlfeouZNW7neo7Z57M")
-CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "PUT_YOUR_CAPSOLVER_API_KEY_HERE")
 
 # Admin User IDs (comma-separated). ဥပမာ: "123456789,987654321"
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "8770379893").split(",") if x.strip().isdigit()]
@@ -57,10 +56,41 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "8770379893").split(
 # Allowed users persistence file
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# Spotify hCaptcha site key (public)
-SPOTIFY_SITE_KEY = "30000aa9-8bf6-4ddd-835f-2ba0a5fc1c20"
+# ════════════════════════════════════════════════════════════════
+# 🧩  CUSTOM CAPTCHA CONFIGURATION
+# ════════════════════════════════════════════════════════════════
+# CAPTCHA_PROVIDER ရွေးစရာများ:
+#   - "capsolver"     → CapSolver API (https://capsolver.com)
+#   - "2captcha"      → 2Captcha API (https://2captcha.com)
+#   - "anticaptcha"   → Anti-Captcha API (https://anti-captcha.com)
+#   - "nopecha"       → NopeCha API (https://nopecha.com)  [စျေးအသက်သာဆုံး]
+#   - "manual"        → User က ကိုယ်တိုင် captcha token ထည့်
+#   - "skip" / "none" → Captcha လုံးဝ မလုပ် (demo only)
+CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "capsolver").lower().strip()
+
+# CAPTCHA_TYPE ရွေးစရာများ:
+#   - "hcaptcha"  → hCaptcha (Spotify default)
+#   - "turnstile" → Cloudflare Turnstile
+#   - "recaptcha" → Google reCAPTCHA v2
+CAPTCHA_TYPE = os.getenv("CAPTCHA_TYPE", "hcaptcha").lower().strip()
+
+# Provider-specific API keys (provider တစ်ခုချင်းအလိုက်)
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
+ANTICAPTCHA_API_KEY = os.getenv("ANTICAPTCHA_API_KEY", "")
+NOPECHA_API_KEY = os.getenv("NOPECHA_API_KEY", "")
+
+# Custom captcha endpoint (advanced - ကိုယ်ပိုင် solver server ရှိရင်)
+CUSTOM_CAPTCHA_URL = os.getenv("CUSTOM_CAPTCHA_URL", "")  # POST endpoint
+CUSTOM_CAPTCHA_KEY = os.getenv("CUSTOM_CAPTCHA_KEY", "")
+
+# Spotify captcha info (public)
+SPOTIFY_SITE_KEY = os.getenv("SPOTIFY_SITE_KEY", "30000aa9-8bf6-4ddd-835f-2ba0a5fc1c20")
 SPOTIFY_SIGNUP_URL = "https://www.spotify.com/signup"
 SPOTIFY_API_URL = "https://spclient.wg.spotify.com/signup/public/v2/account"
+
+# Manual captcha token (manual mode အတွက်)
+MANUAL_CAPTCHA_TOKEN: Optional[str] = None
 
 # Default settings
 MAX_ACCOUNTS_PER_RUN = 50
@@ -169,58 +199,254 @@ def parse_proxies(text: str) -> List[str]:
     return proxies
 
 
-# ════════════════════════════════════════════════════════════════
-# 🧩  CapSolver Integration (hCaptcha)
-# ════════════════════════════════════════════════════════════════
-async def solve_captcha(session: aiohttp.ClientSession) -> Optional[str]:
-    """
-    CapSolver API ကို သုံးပြီး hCaptcha solve လုပ်တယ်။
-    Returns: captcha token (str) သို့မဟုတ် None
-    """
-    if not CAPSOLVER_API_KEY or "PUT_YOUR" in CAPSOLVER_API_KEY:
-        logger.warning("⚠️ CapSolver API key မရှိပါ - captcha skip လုပ်မယ်")
-        return None
+# (old single-provider solve_captcha removed - replaced by router below)
 
+
+# 🧩  CUSTOM CAPTCHA ROUTER  (Multi-Provider Support)
+# ════════════════════════════════════════════════════════════════
+def _task_type_for(provider: str) -> str:
+    """Provider + CAPTCHA_TYPE အပေါ်မူတည်ပြီး task type return"""
+    mapping = {
+        "capsolver": {
+            "hcaptcha": "HCaptchaTaskProxyless",
+            "turnstile": "AntiTurnstileTaskProxyless",
+            "recaptcha": "ReCaptchaV2TaskProxyless",
+        },
+        "anticaptcha": {
+            "hcaptcha": "HCaptchaTaskProxyless",
+            "turnstile": "TurnstileTaskProxyless",
+            "recaptcha": "RecaptchaV2TaskProxyless",
+        },
+    }
+    return mapping.get(provider, {}).get(CAPTCHA_TYPE, "HCaptchaTaskProxyless")
+
+
+async def _solve_capsolver(session: aiohttp.ClientSession) -> Optional[str]:
+    """CapSolver API"""
+    if not CAPSOLVER_API_KEY:
+        logger.warning("⚠️ CAPSOLVER_API_KEY မရှိ")
+        return None
     try:
-        # Create task
-        create_payload = {
+        payload = {
             "clientKey": CAPSOLVER_API_KEY,
             "task": {
-                "type": "HCaptchaTaskProxyless",
+                "type": _task_type_for("capsolver"),
                 "websiteURL": SPOTIFY_SIGNUP_URL,
                 "websiteKey": SPOTIFY_SITE_KEY,
             },
         }
         async with session.post(
             "https://api.capsolver.com/createTask",
-            json=create_payload,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            data = await resp.json()
+            json=payload, timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            data = await r.json()
             if data.get("errorId") != 0:
-                logger.error(f"CapSolver error: {data}")
+                logger.error(f"CapSolver create error: {data}")
                 return None
             task_id = data.get("taskId")
 
-        # Poll result (max ~120s)
         for _ in range(40):
             await asyncio.sleep(3)
             async with session.post(
                 "https://api.capsolver.com/getTaskResult",
                 json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
                 timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                result = await resp.json()
-                status = result.get("status")
-                if status == "ready":
-                    return result.get("solution", {}).get("gRecaptchaResponse")
-                if status == "failed" or result.get("errorId"):
-                    logger.error(f"CapSolver failed: {result}")
+            ) as r:
+                res = await r.json()
+                if res.get("status") == "ready":
+                    sol = res.get("solution", {})
+                    return sol.get("gRecaptchaResponse") or sol.get("token")
+                if res.get("status") == "failed" or res.get("errorId"):
+                    logger.error(f"CapSolver failed: {res}")
                     return None
         return None
     except Exception as e:
-        logger.error(f"Captcha solve exception: {e}")
+        logger.error(f"CapSolver exception: {e}")
         return None
+
+
+async def _solve_2captcha(session: aiohttp.ClientSession) -> Optional[str]:
+    """2Captcha API"""
+    if not TWOCAPTCHA_API_KEY:
+        logger.warning("⚠️ TWOCAPTCHA_API_KEY မရှိ")
+        return None
+    try:
+        method_map = {"hcaptcha": "hcaptcha", "turnstile": "turnstile", "recaptcha": "userrecaptcha"}
+        method = method_map.get(CAPTCHA_TYPE, "hcaptcha")
+        params = {
+            "key": TWOCAPTCHA_API_KEY,
+            "method": method,
+            "sitekey": SPOTIFY_SITE_KEY,
+            "pageurl": SPOTIFY_SIGNUP_URL,
+            "json": 1,
+        }
+        async with session.post("https://2captcha.com/in.php", data=params,
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            data = await r.json()
+            if data.get("status") != 1:
+                logger.error(f"2Captcha submit error: {data}")
+                return None
+            cap_id = data.get("request")
+
+        for _ in range(40):
+            await asyncio.sleep(5)
+            async with session.get(
+                f"https://2captcha.com/res.php?key={TWOCAPTCHA_API_KEY}&action=get&id={cap_id}&json=1",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                res = await r.json()
+                if res.get("status") == 1:
+                    return res.get("request")
+                if res.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                    logger.error(f"2Captcha failed: {res}")
+                    return None
+        return None
+    except Exception as e:
+        logger.error(f"2Captcha exception: {e}")
+        return None
+
+
+async def _solve_anticaptcha(session: aiohttp.ClientSession) -> Optional[str]:
+    """Anti-Captcha API"""
+    if not ANTICAPTCHA_API_KEY:
+        logger.warning("⚠️ ANTICAPTCHA_API_KEY မရှိ")
+        return None
+    try:
+        payload = {
+            "clientKey": ANTICAPTCHA_API_KEY,
+            "task": {
+                "type": _task_type_for("anticaptcha"),
+                "websiteURL": SPOTIFY_SIGNUP_URL,
+                "websiteKey": SPOTIFY_SITE_KEY,
+            },
+        }
+        async with session.post("https://api.anti-captcha.com/createTask",
+                                json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            data = await r.json()
+            if data.get("errorId") != 0:
+                logger.error(f"AntiCaptcha error: {data}")
+                return None
+            task_id = data.get("taskId")
+
+        for _ in range(40):
+            await asyncio.sleep(3)
+            async with session.post(
+                "https://api.anti-captcha.com/getTaskResult",
+                json={"clientKey": ANTICAPTCHA_API_KEY, "taskId": task_id},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                res = await r.json()
+                if res.get("status") == "ready":
+                    sol = res.get("solution", {})
+                    return sol.get("gRecaptchaResponse") or sol.get("token")
+                if res.get("errorId"):
+                    logger.error(f"AntiCaptcha failed: {res}")
+                    return None
+        return None
+    except Exception as e:
+        logger.error(f"AntiCaptcha exception: {e}")
+        return None
+
+
+async def _solve_nopecha(session: aiohttp.ClientSession) -> Optional[str]:
+    """NopeCha API (cheapest option)"""
+    if not NOPECHA_API_KEY:
+        logger.warning("⚠️ NOPECHA_API_KEY မရှိ")
+        return None
+    try:
+        type_map = {"hcaptcha": "hcaptcha", "turnstile": "turnstile", "recaptcha": "recaptcha2"}
+        payload = {
+            "key": NOPECHA_API_KEY,
+            "type": type_map.get(CAPTCHA_TYPE, "hcaptcha"),
+            "sitekey": SPOTIFY_SITE_KEY,
+            "url": SPOTIFY_SIGNUP_URL,
+        }
+        async with session.post("https://api.nopecha.com/token",
+                                json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            data = await r.json()
+            cap_id = data.get("data")
+            if not cap_id:
+                logger.error(f"NopeCha submit error: {data}")
+                return None
+
+        for _ in range(40):
+            await asyncio.sleep(3)
+            async with session.get(
+                f"https://api.nopecha.com/token?key={NOPECHA_API_KEY}&id={cap_id}",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                res = await r.json()
+                if res.get("data"):
+                    return res["data"]
+                if res.get("error") and "incomplete" not in str(res.get("error", "")).lower():
+                    logger.error(f"NopeCha failed: {res}")
+                    return None
+        return None
+    except Exception as e:
+        logger.error(f"NopeCha exception: {e}")
+        return None
+
+
+async def _solve_custom(session: aiohttp.ClientSession) -> Optional[str]:
+    """Custom solver endpoint (your own server)"""
+    if not CUSTOM_CAPTCHA_URL:
+        logger.warning("⚠️ CUSTOM_CAPTCHA_URL မရှိ")
+        return None
+    try:
+        payload = {
+            "type": CAPTCHA_TYPE,
+            "sitekey": SPOTIFY_SITE_KEY,
+            "url": SPOTIFY_SIGNUP_URL,
+            "key": CUSTOM_CAPTCHA_KEY,
+        }
+        async with session.post(CUSTOM_CAPTCHA_URL, json=payload,
+                                timeout=aiohttp.ClientTimeout(total=120)) as r:
+            data = await r.json()
+            return data.get("token") or data.get("solution")
+    except Exception as e:
+        logger.error(f"Custom captcha exception: {e}")
+        return None
+
+
+async def solve_captcha(session: aiohttp.ClientSession) -> Optional[str]:
+    """
+    Custom captcha router.
+    CAPTCHA_PROVIDER env var အပေါ်မူတည်ပြီး သင့်တော်တဲ့ provider ကို သုံးတယ်။
+    """
+    provider = CAPTCHA_PROVIDER
+
+    # Skip / disabled
+    if provider in ("skip", "none", "disabled", ""):
+        logger.info("ℹ️ Captcha skipped (CAPTCHA_PROVIDER=skip)")
+        return None
+
+    # Manual mode (admin က ကိုယ်တိုင် token ပေး)
+    if provider == "manual":
+        if MANUAL_CAPTCHA_TOKEN:
+            logger.info("✅ Using manual captcha token")
+            return MANUAL_CAPTCHA_TOKEN
+        logger.warning("⚠️ Manual mode ဖြစ်ပေမယ့် token မရှိ - /captcha command နဲ့ ထည့်ပါ")
+        return None
+
+    # Custom endpoint
+    if provider == "custom":
+        return await _solve_custom(session)
+
+    # Provider routing
+    solvers = {
+        "capsolver": _solve_capsolver,
+        "2captcha": _solve_2captcha,
+        "anticaptcha": _solve_anticaptcha,
+        "anti-captcha": _solve_anticaptcha,
+        "nopecha": _solve_nopecha,
+    }
+    solver = solvers.get(provider)
+    if not solver:
+        logger.error(f"❌ မသိသော CAPTCHA_PROVIDER: {provider}")
+        return None
+
+    logger.info(f"🧩 Solving {CAPTCHA_TYPE} via {provider}...")
+    return await solver(session)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -371,7 +597,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>host:port</code>\n"
         "<code>user:pass@host:port</code>\n"
         "<code>socks5://user:pass@host:port</code>\n\n"
-        "💡 Captcha က CapSolver API နဲ့ auto-solve လုပ်ပါတယ်"
+        f"💡 Captcha provider: <b>{CAPTCHA_PROVIDER}</b> | Type: <b>{CAPTCHA_TYPE}</b>\n"
+        "🔧 Provider ပြောင်းချင်ရင် env var <code>CAPTCHA_PROVIDER</code> ပြောင်းပါ\n"
+        "    (capsolver / 2captcha / anticaptcha / nopecha / custom / manual / skip)"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -472,6 +700,63 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("  <i>(တစ်ယောက်မှ မရှိသေးပါ)</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_captchainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """လက်ရှိ captcha config ကိုပြ"""
+    keys_status = {
+        "CapSolver": "✅" if CAPSOLVER_API_KEY else "❌",
+        "2Captcha": "✅" if TWOCAPTCHA_API_KEY else "❌",
+        "AntiCaptcha": "✅" if ANTICAPTCHA_API_KEY else "❌",
+        "NopeCha": "✅" if NOPECHA_API_KEY else "❌",
+        "Custom URL": "✅" if CUSTOM_CAPTCHA_URL else "❌",
+    }
+    manual = f"<code>{MANUAL_CAPTCHA_TOKEN[:20]}...</code>" if MANUAL_CAPTCHA_TOKEN else "<i>(none)</i>"
+    txt = (
+        f"🧩 <b>Captcha Configuration</b>\n{DIVIDER}\n"
+        f"🔧 Provider: <b>{CAPTCHA_PROVIDER}</b>\n"
+        f"📝 Type: <b>{CAPTCHA_TYPE}</b>\n"
+        f"🔑 Site key: <code>{SPOTIFY_SITE_KEY}</code>\n\n"
+        f"<b>API Keys:</b>\n" + "\n".join(f"  {v} {k}" for k, v in keys_status.items()) +
+        f"\n\n📌 Manual token: {manual}\n\n"
+        f"<b>Available providers:</b>\n"
+        f"  • capsolver, 2captcha, anticaptcha, nopecha\n"
+        f"  • custom (CUSTOM_CAPTCHA_URL)\n"
+        f"  • manual (/captcha &lt;token&gt;)\n"
+        f"  • skip / none (no captcha)"
+    )
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
+async def cmd_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual mode အတွက် captcha token ထည့်/ဖျက် (admin only)"""
+    global MANUAL_CAPTCHA_TOKEN
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Admin only command")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 Usage:\n"
+            "  <code>/captcha &lt;token&gt;</code> - manual token ထည့်\n"
+            "  <code>/captcha clear</code>      - token ဖျက်",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    arg = " ".join(context.args).strip()
+    if arg.lower() in ("clear", "reset", "delete"):
+        MANUAL_CAPTCHA_TOKEN = None
+        await update.message.reply_text("🗑 Manual captcha token ဖျက်ပြီးပါပြီ")
+        return
+
+    MANUAL_CAPTCHA_TOKEN = arg
+    await update.message.reply_text(
+        f"✅ Manual captcha token သိမ်းပြီးပါပြီ ({len(arg)} chars)\n"
+        f"💡 CAPTCHA_PROVIDER=manual ဖြစ်နေမှ အလုပ်လုပ်မယ်",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,11 +957,14 @@ def main():
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("captcha", cmd_captcha))
+    app.add_handler(CommandHandler("captchainfo", cmd_captchainfo))
     app.add_handler(conv)
 
     print("🎵 Spotify Bot စတင်နေပါပြီ...")
     print(f"👑 Admins: {ADMIN_IDS if ADMIN_IDS != [0] else '⚠️  ADMIN_IDS env var မထည့်ရသေးပါ!'}")
     print(f"✅ Allowed users: {len(ALLOWED_USERS)}")
+    print(f"🧩 Captcha: provider={CAPTCHA_PROVIDER}, type={CAPTCHA_TYPE}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
