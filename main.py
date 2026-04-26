@@ -233,11 +233,57 @@ def gen_birthdate() -> Dict[str, str]:
     }
 
 
+def _normalize_proxy(raw: str) -> str:
+    """
+    Proxy string တစ်ခုကို standard URL format ပြောင်း:
+        scheme://user:pass@host:port
+
+    Support formats:
+      - host:port
+      - host:port:user:pass            (Geonode style)
+      - user:pass@host:port
+      - http://host:port
+      - http://host:port:user:pass     (broken Geonode style — auto-fix)
+      - socks5://user:pass@host:port
+    """
+    raw = raw.strip()
+    if not raw:
+        return raw
+
+    # Split scheme
+    scheme = "http"
+    rest = raw
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+
+    # Already correct: has "@" → trust it
+    if "@" in rest:
+        return f"{scheme}://{rest}"
+
+    # No "@" → check colon parts
+    parts = rest.split(":")
+    if len(parts) == 2:
+        # host:port
+        return f"{scheme}://{rest}"
+    if len(parts) == 4:
+        # host:port:user:pass  (Geonode)
+        host, port, user, pwd = parts
+        return f"{scheme}://{user}:{pwd}@{host}:{port}"
+    if len(parts) == 3:
+        # Ambiguous — assume host:port:something → drop trailing
+        host, port, _ = parts
+        return f"{scheme}://{host}:{port}"
+
+    # Fallback: return as-is with scheme
+    return f"{scheme}://{rest}"
+
+
 def parse_proxies(text: str) -> List[str]:
     """
     Proxy list ကို parse လုပ်တယ်။
     Format support:
       - host:port
+      - host:port:user:pass         (Geonode/residential style)
       - user:pass@host:port
       - http://host:port
       - socks5://user:pass@host:port
@@ -247,10 +293,7 @@ def parse_proxies(text: str) -> List[str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Add scheme if missing
-        if "://" not in line:
-            line = f"http://{line}"
-        proxies.append(line)
+        proxies.append(_normalize_proxy(line))
     return proxies
 
 
@@ -404,7 +447,16 @@ async def _solve_anticaptcha(session: aiohttp.ClientSession) -> Optional[str]:
 
 
 async def _solve_nopecha(session: aiohttp.ClientSession) -> Optional[str]:
-    """NopeCha API (cheapest option)"""
+    """NopeCha API (cheapest option)
+    
+    NopeCha flow:
+    1. POST /token  → returns {"data": "<job_id>"}
+    2. GET  /token?id=<job_id>  → poll until {"data": "<token>"}
+       - error 14 = "Incomplete job" = STILL PROCESSING (keep polling!)
+       - error 9  = "Invalid request"
+       - error 10 = "Rate limit"
+       - error 11 = "Invalid key" / unauthorized
+    """
     if not NOPECHA_API_KEY:
         logger.warning("⚠️ NOPECHA_API_KEY မရှိ")
         return None
@@ -421,21 +473,47 @@ async def _solve_nopecha(session: aiohttp.ClientSession) -> Optional[str]:
             data = await r.json()
             cap_id = data.get("data")
             if not cap_id:
-                logger.error(f"NopeCha submit error: {data}")
+                err_code = data.get("error")
+                err_msg = data.get("message", "unknown")
+                if err_code == 11:
+                    logger.error(f"❌ NopeCha API key invalid/unauthorized: {data}")
+                elif err_code == 10:
+                    logger.error(f"⏳ NopeCha rate-limited: {data}")
+                else:
+                    logger.error(f"NopeCha submit error: {data}")
                 return None
 
-        for _ in range(40):
+        logger.info(f"✅ NopeCha job submitted (id={cap_id}), polling for solution...")
+
+        # Poll for up to ~120s (40 attempts × 3s). hCaptcha typically resolves in 15-45s.
+        for attempt in range(40):
             await asyncio.sleep(3)
             async with session.get(
                 f"https://api.nopecha.com/token?key={NOPECHA_API_KEY}&id={cap_id}",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as r:
                 res = await r.json()
-                if res.get("data"):
-                    return res["data"]
-                if res.get("error") and "incomplete" not in str(res.get("error", "")).lower():
-                    logger.error(f"NopeCha failed: {res}")
+
+                # ✅ Success: token ready
+                token = res.get("data")
+                if token and isinstance(token, str) and len(token) > 20:
+                    logger.info(f"✅ NopeCha solved in {(attempt + 1) * 3}s")
+                    return token
+
+                err_code = res.get("error")
+
+                # ⏳ error 14 = "Incomplete job" = STILL PROCESSING — keep polling!
+                if err_code == 14:
+                    if attempt % 5 == 0:
+                        logger.info(f"⏳ NopeCha still solving... ({(attempt + 1) * 3}s elapsed)")
+                    continue
+
+                # ❌ Real errors — stop
+                if err_code is not None:
+                    logger.error(f"❌ NopeCha failed (code {err_code}): {res}")
                     return None
+
+        logger.error(f"⏱ NopeCha timeout after 120s (job_id={cap_id})")
         return None
     except Exception as e:
         logger.error(f"NopeCha exception: {e}")
@@ -522,7 +600,8 @@ async def create_spotify_account(
     connector = None
     if proxy:
         try:
-            connector = ProxyConnector.from_url(proxy)
+            normalized = _normalize_proxy(proxy)
+            connector = ProxyConnector.from_url(normalized)
         except Exception as e:
             logger.warning(f"Proxy parse failed ({proxy}): {e}")
             connector = None
