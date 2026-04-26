@@ -653,6 +653,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
 def custom_captcha_keyboard() -> InlineKeyboardMarkup:
     """Custom Captcha API management menu"""
     rows = [
+        [InlineKeyboardButton("🔑 Set Provider API Key", callback_data="cc:setkey")],
         [InlineKeyboardButton("➕ Set Custom URL + Key", callback_data="cc:set")],
         [InlineKeyboardButton("🔄 Switch Provider", callback_data="cc:switchprov")],
         [InlineKeyboardButton("🎯 Switch Type", callback_data="cc:switchtype")],
@@ -660,6 +661,28 @@ def custom_captcha_keyboard() -> InlineKeyboardMarkup:
     if CUSTOM_CAPTCHA_URL:
         rows.append([InlineKeyboardButton("🗑 Clear Custom Config", callback_data="cc:clear")])
     rows.append([InlineKeyboardButton("⬅️ Back to Admin", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def provider_key_picker_keyboard() -> InlineKeyboardMarkup:
+    """Pick which provider's API key to set"""
+    providers = [
+        ("nopecha", "🟢 NopeCha"),
+        ("capsolver", "🔵 CapSolver"),
+        ("2captcha", "🟡 2Captcha"),
+        ("anticaptcha", "🟣 AntiCaptcha"),
+    ]
+    rows = []
+    row = []
+    for key, label in providers:
+        active = " ✅" if key == CAPTCHA_PROVIDER else ""
+        row.append(InlineKeyboardButton(f"{label}{active}", callback_data=f"cc:pickkey:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:customcaptcha")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1193,10 +1216,94 @@ async def cc_handle_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cc_setkey_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry: triggered by callback cc:pickkey:<provider>"""
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("⛔ Admin only")
+        return ConversationHandler.END
+
+    provider = query.data.split(":", 2)[2]
+    context.user_data["pending_key_provider"] = provider
+
+    label_map = {
+        "nopecha": "🟢 NopeCha",
+        "capsolver": "🔵 CapSolver",
+        "2captcha": "🟡 2Captcha",
+        "anticaptcha": "🟣 AntiCaptcha",
+    }
+    example_map = {
+        "nopecha": "<code>sub_1TQNBjCRwBwvt6ptQ8sTiOLO</code>\n(NopeCha က subscription ID ကို API key အဖြစ်သုံးတယ်)",
+        "capsolver": "<code>CAP-XXXXXXXXXXXXXXXXXXXXXXXX</code>",
+        "2captcha": "<code>32-char hex string</code>",
+        "anticaptcha": "<code>32-char hex string</code>",
+    }
+
+    await query.message.reply_text(
+        f"🔑 <b>{label_map.get(provider, provider)} API Key ထည့်ပါ</b>\n"
+        f"{DIVIDER}\n"
+        f"ဥပမာ: {example_map.get(provider, '<code>your-api-key</code>')}\n\n"
+        "👇 အောက်မှာ API key ကို ရိုက်ထည့်ပါ\n"
+        "(ဖျက်ချင်ရင် <b>clear</b> ဆိုပြီး ရိုက်ပါ)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cc_cancel_keyboard(),
+    )
+    return ASK_PROVIDER_API_KEY
+
+
+async def cc_handle_provider_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CAPSOLVER_API_KEY, NOPECHA_API_KEY, TWOCAPTCHA_API_KEY, ANTICAPTCHA_API_KEY, CAPTCHA_PROVIDER
+    raw = (update.message.text or "").strip()
+    provider = context.user_data.pop("pending_key_provider", "")
+    if not provider:
+        await update.message.reply_text("❌ Session expired. ပြန်စပါ။")
+        return ConversationHandler.END
+
+    if raw.lower() in ("clear", "delete", "remove", "-"):
+        new_key = ""
+    else:
+        new_key = raw
+
+    if provider == "nopecha":
+        NOPECHA_API_KEY = new_key
+    elif provider == "capsolver":
+        CAPSOLVER_API_KEY = new_key
+    elif provider == "2captcha":
+        TWOCAPTCHA_API_KEY = new_key
+    elif provider == "anticaptcha":
+        ANTICAPTCHA_API_KEY = new_key
+    else:
+        await update.message.reply_text("❌ Unknown provider")
+        return ConversationHandler.END
+
+    # auto-switch active provider when a key was set
+    if new_key:
+        CAPTCHA_PROVIDER = provider
+
+    save_captcha_config()
+
+    masked = (new_key[:8] + "..." + new_key[-4:]) if len(new_key) > 14 else (new_key or "<i>(cleared)</i>")
+    await update.message.reply_text(
+        "✅ <b>API Key သိမ်းပြီးပါပြီ!</b>\n"
+        f"{DIVIDER}\n"
+        f"🔧 Provider: <b>{provider}</b>\n"
+        f"🔑 Key: <code>{masked}</code>\n"
+        f"🎯 Active: <b>{CAPTCHA_PROVIDER}</b>\n\n"
+        "💡 <code>/captchainfo</code> နဲ့ စစ်ကြည့်ပါ",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def cc_cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel from button or /cancel"""
     query = update.callback_query
     context.user_data.pop("pending_custom_url", None)
+    context.user_data.pop("pending_key_provider", None)
     if query:
         await query.answer()
         await query.message.reply_text(
@@ -1351,6 +1458,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data == "cc:setkey" and is_admin(user_id):
+            await query.edit_message_text(
+                "🔑 <b>Provider API Key ထည့်မယ်</b>\n"
+                f"{DIVIDER}\n"
+                "ဘယ် provider အတွက် API key ထည့်ချင်လဲ?\n"
+                "ရွေးပြီးရင် ဆက်ပြီး key ရိုက်ထည့်ရပါမယ်။\n\n"
+                "💡 Key ထည့်ပြီးတာနဲ့ active provider ကို\n"
+                "<b>auto-switch</b> လုပ်ပေးပါမယ်",
+                parse_mode=ParseMode.HTML,
+                reply_markup=provider_key_picker_keyboard(),
+            )
+            return
+
         if data == "cc:switchprov" and is_admin(user_id):
             await query.edit_message_text(
                 "🔄 <b>Captcha Provider ရွေးပါ</b>\n"
@@ -1432,10 +1552,14 @@ def main():
 
     # Custom Captcha API setup conversation (admin only, button-driven)
     cc_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cc_set_entry, pattern=r"^cc:set$")],
+        entry_points=[
+            CallbackQueryHandler(cc_set_entry, pattern=r"^cc:set$"),
+            CallbackQueryHandler(cc_setkey_entry, pattern=r"^cc:pickkey:(nopecha|capsolver|2captcha|anticaptcha)$"),
+        ],
         states={
             ASK_CUSTOM_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, cc_handle_url)],
             ASK_CUSTOM_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, cc_handle_key)],
+            ASK_PROVIDER_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, cc_handle_provider_key)],
         },
         fallbacks=[
             CommandHandler("cancel", cc_cancel_conv),
