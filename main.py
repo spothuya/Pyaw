@@ -102,9 +102,14 @@ DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━
 # Conversation states
 # ════════════════════════════════════════════════════════════════
 ASK_DOMAIN, ASK_COUNT, ASK_PROXY = range(3)
+ASK_CUSTOM_URL, ASK_CUSTOM_KEY = range(10, 12)
+ASK_PROVIDER_API_KEY = 20  # for setting capsolver/nopecha/etc keys via UI
 
 # In-memory user session store
 USER_DATA: Dict[int, Dict] = {}
+
+# Captcha config persistence file
+CAPTCHA_CONFIG_FILE = os.getenv("CAPTCHA_CONFIG_FILE", "captcha_config.json")
 
 # Logging setup
 logging.basicConfig(
@@ -149,6 +154,56 @@ def save_allowed_users(users: set) -> None:
 
 
 ALLOWED_USERS: set = load_allowed_users()
+
+
+# ════════════════════════════════════════════════════════════════
+# 🧩  Captcha Config Persistence (runtime override)
+# ════════════════════════════════════════════════════════════════
+def load_captcha_config() -> dict:
+    try:
+        if os.path.exists(CAPTCHA_CONFIG_FILE):
+            with open(CAPTCHA_CONFIG_FILE, "r") as f:
+                return json.load(f) or {}
+    except Exception as e:
+        logger.error(f"Load captcha config error: {e}")
+    return {}
+
+
+def save_captcha_config() -> None:
+    try:
+        cfg = {
+            "provider": CAPTCHA_PROVIDER,
+            "type": CAPTCHA_TYPE,
+            "custom_url": CUSTOM_CAPTCHA_URL,
+            "custom_key": CUSTOM_CAPTCHA_KEY,
+            "capsolver_key": CAPSOLVER_API_KEY,
+            "nopecha_key": NOPECHA_API_KEY,
+            "twocaptcha_key": TWOCAPTCHA_API_KEY,
+            "anticaptcha_key": ANTICAPTCHA_API_KEY,
+        }
+        with open(CAPTCHA_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        logger.error(f"Save captcha config error: {e}")
+
+
+def _apply_captcha_config(cfg: dict) -> None:
+    """Apply persisted config back into module globals (called at startup)."""
+    global CAPTCHA_PROVIDER, CAPTCHA_TYPE, CUSTOM_CAPTCHA_URL, CUSTOM_CAPTCHA_KEY
+    global CAPSOLVER_API_KEY, NOPECHA_API_KEY, TWOCAPTCHA_API_KEY, ANTICAPTCHA_API_KEY
+    if not cfg:
+        return
+    CAPTCHA_PROVIDER = cfg.get("provider", CAPTCHA_PROVIDER)
+    CAPTCHA_TYPE = cfg.get("type", CAPTCHA_TYPE)
+    CUSTOM_CAPTCHA_URL = cfg.get("custom_url", CUSTOM_CAPTCHA_URL)
+    CUSTOM_CAPTCHA_KEY = cfg.get("custom_key", CUSTOM_CAPTCHA_KEY)
+    CAPSOLVER_API_KEY = cfg.get("capsolver_key", CAPSOLVER_API_KEY)
+    NOPECHA_API_KEY = cfg.get("nopecha_key", NOPECHA_API_KEY)
+    TWOCAPTCHA_API_KEY = cfg.get("twocaptcha_key", TWOCAPTCHA_API_KEY)
+    ANTICAPTCHA_API_KEY = cfg.get("anticaptcha_key", ANTICAPTCHA_API_KEY)
+
+
+_apply_captcha_config(load_captcha_config())
 
 
 def is_admin(user_id: int) -> bool:
@@ -556,39 +611,140 @@ async def create_spotify_account(
 # ════════════════════════════════════════════════════════════════
 # 🤖  Telegram Bot Handlers
 # ════════════════════════════════════════════════════════════════
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    admin_note = ""
+# ════════════════════════════════════════════════════════════════
+# 🎨  Inline Keyboard Builders (လှလှလေးတွေ)
+# ════════════════════════════════════════════════════════════════
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("🚀 Create Account", callback_data="menu:create"),
+            InlineKeyboardButton("📖 Help", callback_data="menu:help"),
+        ],
+        [
+            InlineKeyboardButton("🧩 Captcha Info", callback_data="menu:captchainfo"),
+            InlineKeyboardButton("🆔 My ID", callback_data="menu:myid"),
+        ],
+    ]
     if is_admin(user_id):
-        admin_note = (
-            "\n👑 <b>Admin Commands:</b>\n"
-            "  /adduser &lt;user_id&gt;    - User ထည့်\n"
-            "  /removeuser &lt;user_id&gt; - User ဖြုတ်\n"
-            "  /users               - User စာရင်းကြည့်\n"
-            "  /myid                - ကိုယ့် ID ကြည့်\n"
-        )
+        rows.append([
+            InlineKeyboardButton("👑 Admin Panel", callback_data="menu:admin"),
+        ])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="menu:close")])
+    return InlineKeyboardMarkup(rows)
 
-    text = (
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 User List", callback_data="admin:users"),
+            InlineKeyboardButton("🧩 Captcha", callback_data="admin:captcha"),
+        ],
+        [
+            InlineKeyboardButton("🔧 Custom Captcha API", callback_data="admin:customcaptcha"),
+        ],
+        [
+            InlineKeyboardButton("➕ Add User Help", callback_data="admin:addhelp"),
+            InlineKeyboardButton("➖ Remove Help", callback_data="admin:removehelp"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu:back")],
+    ])
+
+
+def custom_captcha_keyboard() -> InlineKeyboardMarkup:
+    """Custom Captcha API management menu"""
+    rows = [
+        [InlineKeyboardButton("➕ Set Custom URL + Key", callback_data="cc:set")],
+        [InlineKeyboardButton("🔄 Switch Provider", callback_data="cc:switchprov")],
+        [InlineKeyboardButton("🎯 Switch Type", callback_data="cc:switchtype")],
+    ]
+    if CUSTOM_CAPTCHA_URL:
+        rows.append([InlineKeyboardButton("🗑 Clear Custom Config", callback_data="cc:clear")])
+    rows.append([InlineKeyboardButton("⬅️ Back to Admin", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def provider_switch_keyboard() -> InlineKeyboardMarkup:
+    """Choose CAPTCHA_PROVIDER"""
+    providers = [
+        ("capsolver", "CapSolver"),
+        ("nopecha", "NopeCha"),
+        ("2captcha", "2Captcha"),
+        ("anticaptcha", "AntiCaptcha"),
+        ("custom", "🔧 Custom"),
+        ("manual", "✋ Manual"),
+        ("skip", "⏭ Skip"),
+    ]
+    rows = []
+    row = []
+    for key, label in providers:
+        prefix = "✅ " if key == CAPTCHA_PROVIDER else ""
+        row.append(InlineKeyboardButton(f"{prefix}{label}", callback_data=f"cc:setprov:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:customcaptcha")])
+    return InlineKeyboardMarkup(rows)
+
+
+def type_switch_keyboard() -> InlineKeyboardMarkup:
+    """Choose CAPTCHA_TYPE"""
+    types = [("hcaptcha", "hCaptcha"), ("turnstile", "Turnstile"), ("recaptcha", "reCAPTCHA")]
+    rows = [[]]
+    for key, label in types:
+        prefix = "✅ " if key == CAPTCHA_TYPE else ""
+        rows[0].append(InlineKeyboardButton(f"{prefix}{label}", callback_data=f"cc:settype:{key}"))
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:customcaptcha")])
+    return InlineKeyboardMarkup(rows)
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:back")]
+    ])
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="menu:cancel")]
+    ])
+
+
+def cc_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="cc:cancel")]
+    ])
+
+
+def _start_text(user_id: int) -> str:
+    role = "👑 Admin" if is_admin(user_id) else ("✅ Allowed" if is_allowed(user_id) else "❌ Not allowed")
+    return (
         "🎵 <b>Spotify Account Creator Bot</b>\n"
         f"{DIVIDER}\n"
-        f"မင်္ဂလာပါ! Your ID: <code>{user_id}</code>\n"
+        f"မင်္ဂလာပါ! 👋\n"
+        f"🆔 Your ID: <code>{user_id}</code>\n"
+        f"🔐 Status: {role}\n\n"
         "ဒီ bot က Custom Domain နဲ့ Spotify\n"
-        "account အသစ်တွေကို auto-generate လုပ်ပေးပါတယ်။\n\n"
-        "<b>Commands:</b>\n"
-        "  /create  - Account အသစ် ဖန်တီးမယ်\n"
-        "  /help    - အသုံးပြုနည်း\n"
-        "  /cancel  - လုပ်ဆောင်ချက်ကို ရပ်မယ်\n"
-        f"{admin_note}\n"
-        "👉 စတင်ဖို့ /create ကို ရိုက်ပါ"
+        "account အသစ်တွေကို auto-generate လုပ်ပေးပါတယ် ✨\n\n"
+        "👇 <b>အောက်က ခလုတ်တွေကို နှိပ်ပြီး စတင်ပါ</b>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        _start_text(user_id),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(user_id),
+    )
+
+
+def _help_text() -> str:
+    return (
         "📖 <b>အသုံးပြုနည်း</b>\n"
         f"{DIVIDER}\n"
-        "1️⃣ /create ရိုက်ပါ\n"
+        "1️⃣ <b>Create Account</b> ခလုတ်နှိပ် (သို့) /create\n"
         "2️⃣ Domain ထည့်ပါ (ဥပမာ: <code>@thuyapro.com</code>)\n"
         "3️⃣ Account အရေအတွက် ထည့်ပါ (1-50)\n"
         "4️⃣ Proxy list ထည့်ပါ (ရှိရင်) (သို့) <b>skip</b>\n"
@@ -597,11 +753,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>host:port</code>\n"
         "<code>user:pass@host:port</code>\n"
         "<code>socks5://user:pass@host:port</code>\n\n"
-        f"💡 Captcha provider: <b>{CAPTCHA_PROVIDER}</b> | Type: <b>{CAPTCHA_TYPE}</b>\n"
-        "🔧 Provider ပြောင်းချင်ရင် env var <code>CAPTCHA_PROVIDER</code> ပြောင်းပါ\n"
-        "    (capsolver / 2captcha / anticaptcha / nopecha / custom / manual / skip)"
+        f"💡 Captcha provider: <b>{CAPTCHA_PROVIDER}</b> | Type: <b>{CAPTCHA_TYPE}</b>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        _help_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_keyboard(),
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -682,28 +843,32 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ Admin only command")
-        return
-
+def _users_text() -> str:
     lines = [f"👑 <b>Admins ({len(ADMIN_IDS)}):</b>"]
     for aid in ADMIN_IDS:
         lines.append(f"  • <code>{aid}</code>")
-
     lines.append(f"\n✅ <b>Allowed Users ({len(ALLOWED_USERS)}):</b>")
     if ALLOWED_USERS:
         for uid in sorted(ALLOWED_USERS):
             lines.append(f"  • <code>{uid}</code>")
     else:
         lines.append("  <i>(တစ်ယောက်မှ မရှိသေးပါ)</i>")
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Admin only command")
+        return
+    await update.message.reply_text(
+        _users_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_keyboard(),
+    )
 
 
-async def cmd_captchainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """လက်ရှိ captcha config ကိုပြ"""
+def _captchainfo_text() -> str:
     keys_status = {
         "CapSolver": "✅" if CAPSOLVER_API_KEY else "❌",
         "2Captcha": "✅" if TWOCAPTCHA_API_KEY else "❌",
@@ -712,7 +877,7 @@ async def cmd_captchainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Custom URL": "✅" if CUSTOM_CAPTCHA_URL else "❌",
     }
     manual = f"<code>{MANUAL_CAPTCHA_TOKEN[:20]}...</code>" if MANUAL_CAPTCHA_TOKEN else "<i>(none)</i>"
-    txt = (
+    return (
         f"🧩 <b>Captcha Configuration</b>\n{DIVIDER}\n"
         f"🔧 Provider: <b>{CAPTCHA_PROVIDER}</b>\n"
         f"📝 Type: <b>{CAPTCHA_TYPE}</b>\n"
@@ -725,7 +890,15 @@ async def cmd_captchainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • manual (/captcha &lt;token&gt;)\n"
         f"  • skip / none (no captcha)"
     )
-    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
+async def cmd_captchainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """လက်ရှိ captcha config ကိုပြ"""
+    await update.message.reply_text(
+        _captchainfo_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_keyboard(),
+    )
 
 
 async def cmd_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,8 +934,13 @@ async def cmd_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # Support both /create command and callback button
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if target is None:
+        return ConversationHandler.END
+
     if not is_allowed(user_id):
-        await update.message.reply_text(
+        await target.reply_text(
             f"⛔ <b>Access Denied</b>\n"
             f"{DIVIDER}\n"
             f"ဒီ bot ကို သုံးခွင့်မရှိပါ။\n"
@@ -773,11 +951,12 @@ async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     USER_DATA[user_id] = {}
-    await update.message.reply_text(
+    await target.reply_text(
         "📧 <b>Step 1/3:</b> ဘယ် Domain နဲ့ ဖွင့်ချင်ပါသလဲ?\n\n"
         "ဥပမာ: <code>@thuyapro.com</code> သို့မဟုတ် <code>thuyapro.com</code>\n\n"
-        "ရပ်ချင်ရင် /cancel",
+        "👇 ရပ်ချင်ရင် ခလုတ်နှိပ် (သို့) /cancel",
         parse_mode=ParseMode.HTML,
+        reply_markup=cancel_keyboard(),
     )
     return ASK_DOMAIN
 
@@ -927,8 +1106,308 @@ async def handle_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USER_DATA.pop(user_id, None)
-    await update.message.reply_text("❌ ရပ်ပြီးပါပြီ။ ပြန်စဖို့ /create")
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if target is not None:
+        await target.reply_text(
+            "❌ ရပ်ပြီးပါပြီ။ ပြန်စဖို့ /create သို့မဟုတ် 👇 ခလုတ်နှိပ်",
+            reply_markup=main_menu_keyboard(user_id),
+        )
     return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════════════════
+# 🔧  Custom Captcha API - Conversation handlers
+# ════════════════════════════════════════════════════════════════
+async def cc_set_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point: triggered by callback button cc:set"""
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("⛔ Admin only")
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        "🔧 <b>Custom Captcha API ထည့်မယ်</b>\n"
+        f"{DIVIDER}\n"
+        "📍 <b>Step 1/2:</b> Custom Captcha API <b>URL</b> ထည့်ပါ\n\n"
+        "ဥပမာ: <code>https://my-solver.com/api/solve</code>\n\n"
+        "💡 ဒီ endpoint က JSON POST လက်ခံပြီး\n"
+        "<code>{\"token\": \"...\"}</code> ပြန်ပေးရမယ်",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cc_cancel_keyboard(),
+    )
+    return ASK_CUSTOM_URL
+
+
+async def cc_handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = (update.message.text or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text(
+            "❌ URL မမှန်ပါ။ <code>http://</code> သို့မဟုတ် <code>https://</code> နဲ့စရပါမယ်။\n"
+            "ပြန်ထည့်ပါ (သို့) ❌ Cancel",
+            parse_mode=ParseMode.HTML,
+            reply_markup=cc_cancel_keyboard(),
+        )
+        return ASK_CUSTOM_URL
+
+    context.user_data["pending_custom_url"] = url
+    await update.message.reply_text(
+        "✅ URL သိမ်းပြီးပါပြီ\n\n"
+        "📍 <b>Step 2/2:</b> Custom API <b>Key</b> ထည့်ပါ\n\n"
+        "(ဘာ key မှ မလိုရင် <b>skip</b> ဆိုပြီးရိုက်ပါ)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cc_cancel_keyboard(),
+    )
+    return ASK_CUSTOM_KEY
+
+
+async def cc_handle_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CUSTOM_CAPTCHA_URL, CUSTOM_CAPTCHA_KEY, CAPTCHA_PROVIDER
+    key = (update.message.text or "").strip()
+    if key.lower() in ("skip", "none", "-"):
+        key = ""
+
+    new_url = context.user_data.pop("pending_custom_url", "")
+    if not new_url:
+        await update.message.reply_text("❌ Session expired ဖြစ်နေတယ်။ ပြန်စပါ။")
+        return ConversationHandler.END
+
+    CUSTOM_CAPTCHA_URL = new_url
+    CUSTOM_CAPTCHA_KEY = key
+    CAPTCHA_PROVIDER = "custom"  # auto-switch
+    save_captcha_config()
+
+    masked_key = (key[:6] + "..." + key[-4:]) if len(key) > 12 else (key or "<i>(none)</i>")
+    await update.message.reply_text(
+        "✅ <b>Custom Captcha API သတ်မှတ်ပြီးပါပြီ!</b>\n"
+        f"{DIVIDER}\n"
+        f"🔗 URL: <code>{new_url}</code>\n"
+        f"🔑 Key: <code>{masked_key}</code>\n"
+        f"🔧 Provider: <b>custom</b> (auto-switched)\n\n"
+        "💡 <code>/create</code> နဲ့ စမ်းကြည့်ပါ",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def cc_cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel from button or /cancel"""
+    query = update.callback_query
+    context.user_data.pop("pending_custom_url", None)
+    if query:
+        await query.answer()
+        await query.message.reply_text(
+            "❌ Custom Captcha setup ရပ်ပြီးပါပြီ",
+            reply_markup=admin_panel_keyboard(),
+        )
+    elif update.message:
+        await update.message.reply_text(
+            "❌ ရပ်ပြီးပါပြီ",
+            reply_markup=admin_panel_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════════════════
+# 🎯  Callback Query Handler  (Inline Buttons)
+# ════════════════════════════════════════════════════════════════
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CAPTCHA_PROVIDER, CAPTCHA_TYPE, CUSTOM_CAPTCHA_URL, CUSTOM_CAPTCHA_KEY
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()  # remove loading spinner
+    user_id = query.from_user.id
+    data = query.data or ""
+
+    try:
+        if data == "menu:create":
+            if not is_allowed(user_id):
+                await query.message.reply_text(
+                    f"⛔ <b>Access Denied</b>\n🆔 ID: <code>{user_id}</code>\n"
+                    "Admin ကို ID ပေးပြီး ထည့်ခိုင်းပါ ✅",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await query.message.reply_text(
+                "🚀 စတင်ဖို့ <code>/create</code> ကို ရိုက်ပါ\n"
+                "<i>(Inline button ကနေ conversation flow စလို့မရပါ)</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if data == "menu:help":
+            await query.edit_message_text(
+                _help_text(), parse_mode=ParseMode.HTML, reply_markup=back_keyboard(),
+            )
+            return
+
+        if data == "menu:captchainfo":
+            await query.edit_message_text(
+                _captchainfo_text(), parse_mode=ParseMode.HTML, reply_markup=back_keyboard(),
+            )
+            return
+
+        if data == "menu:myid":
+            user = query.from_user
+            role = "👑 Admin" if is_admin(user.id) else ("✅ Allowed" if is_allowed(user.id) else "❌ Not allowed")
+            await query.edit_message_text(
+                f"🆔 <b>Your Telegram ID:</b> <code>{user.id}</code>\n"
+                f"👤 Name: {user.full_name}\n"
+                f"🔐 Status: {role}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard(),
+            )
+            return
+
+        if data == "menu:admin":
+            if not is_admin(user_id):
+                await query.message.reply_text("⛔ Admin only")
+                return
+            await query.edit_message_text(
+                "👑 <b>Admin Panel</b>\n"
+                f"{DIVIDER}\n"
+                f"📊 Total allowed users: <b>{len(ALLOWED_USERS)}</b>\n"
+                f"👑 Total admins: <b>{len(ADMIN_IDS)}</b>\n\n"
+                "👇 လုပ်ဆောင်ချက် ရွေးပါ",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if data == "menu:back":
+            await query.edit_message_text(
+                _start_text(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            return
+
+        if data == "menu:close":
+            await query.edit_message_text("👋 ပိတ်ပြီးပါပြီ။ ပြန်စဖို့ /start")
+            return
+
+        if data == "menu:cancel":
+            USER_DATA.pop(user_id, None)
+            await query.edit_message_text(
+                "❌ ရပ်ပြီးပါပြီ။\n👇 ပြန်စဖို့",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            return
+
+        # ───── Admin sub-panel ─────
+        if data == "admin:users" and is_admin(user_id):
+            await query.edit_message_text(
+                _users_text(), parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if data == "admin:captcha" and is_admin(user_id):
+            await query.edit_message_text(
+                _captchainfo_text(), parse_mode=ParseMode.HTML, reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if data == "admin:addhelp" and is_admin(user_id):
+            await query.edit_message_text(
+                "➕ <b>Add User</b>\n"
+                f"{DIVIDER}\n"
+                "Command: <code>/adduser &lt;user_id&gt;</code>\n"
+                "ဥပမာ: <code>/adduser 123456789</code>\n\n"
+                "💡 User က /myid ရိုက်ရင် သူ့ ID ရရှိနိုင်ပါတယ်",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        if data == "admin:removehelp" and is_admin(user_id):
+            await query.edit_message_text(
+                "➖ <b>Remove User</b>\n"
+                f"{DIVIDER}\n"
+                "Command: <code>/removeuser &lt;user_id&gt;</code>\n"
+                "ဥပမာ: <code>/removeuser 123456789</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_panel_keyboard(),
+            )
+            return
+
+        # ───── Custom Captcha API panel ─────
+        if data == "admin:customcaptcha" and is_admin(user_id):
+            url_display = f"<code>{CUSTOM_CAPTCHA_URL}</code>" if CUSTOM_CAPTCHA_URL else "<i>(not set)</i>"
+            key_display = "✅ set" if CUSTOM_CAPTCHA_KEY else "❌ none"
+            await query.edit_message_text(
+                "🔧 <b>Custom Captcha API Panel</b>\n"
+                f"{DIVIDER}\n"
+                f"🔧 Active Provider: <b>{CAPTCHA_PROVIDER}</b>\n"
+                f"🎯 Captcha Type: <b>{CAPTCHA_TYPE}</b>\n"
+                f"🔗 Custom URL: {url_display}\n"
+                f"🔑 Custom Key: {key_display}\n\n"
+                "👇 လုပ်ဆောင်ချက်ရွေးပါ",
+                parse_mode=ParseMode.HTML,
+                reply_markup=custom_captcha_keyboard(),
+            )
+            return
+
+        if data == "cc:switchprov" and is_admin(user_id):
+            await query.edit_message_text(
+                "🔄 <b>Captcha Provider ရွေးပါ</b>\n"
+                f"{DIVIDER}\n"
+                f"လက်ရှိ: <b>{CAPTCHA_PROVIDER}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=provider_switch_keyboard(),
+            )
+            return
+
+        if data == "cc:switchtype" and is_admin(user_id):
+            await query.edit_message_text(
+                "🎯 <b>Captcha Type ရွေးပါ</b>\n"
+                f"{DIVIDER}\n"
+                f"လက်ရှိ: <b>{CAPTCHA_TYPE}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=type_switch_keyboard(),
+            )
+            return
+
+        if data.startswith("cc:setprov:") and is_admin(user_id):
+            new_prov = data.split(":", 2)[2]
+            CAPTCHA_PROVIDER = new_prov
+            save_captcha_config()
+            await query.edit_message_text(
+                f"✅ Provider ပြောင်းပြီးပါပြီ → <b>{new_prov}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=custom_captcha_keyboard(),
+            )
+            return
+
+        if data.startswith("cc:settype:") and is_admin(user_id):
+            new_type = data.split(":", 2)[2]
+            CAPTCHA_TYPE = new_type
+            save_captcha_config()
+            await query.edit_message_text(
+                f"✅ Captcha Type ပြောင်းပြီးပါပြီ → <b>{new_type}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=custom_captcha_keyboard(),
+            )
+            return
+
+        if data == "cc:clear" and is_admin(user_id):
+            CUSTOM_CAPTCHA_URL = ""
+            CUSTOM_CAPTCHA_KEY = ""
+            save_captcha_config()
+            await query.edit_message_text(
+                "🗑 Custom Captcha config ဖျက်ပြီးပါပြီ",
+                parse_mode=ParseMode.HTML,
+                reply_markup=custom_captcha_keyboard(),
+            )
+            return
+    except Exception as e:
+        try:
+            await query.message.reply_text(f"⚠️ Error: {e}")
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════
@@ -951,6 +1430,20 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
+    # Custom Captcha API setup conversation (admin only, button-driven)
+    cc_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cc_set_entry, pattern=r"^cc:set$")],
+        states={
+            ASK_CUSTOM_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, cc_handle_url)],
+            ASK_CUSTOM_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, cc_handle_key)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cc_cancel_conv),
+            CallbackQueryHandler(cc_cancel_conv, pattern=r"^cc:cancel$"),
+        ],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
@@ -960,6 +1453,8 @@ def main():
     app.add_handler(CommandHandler("captcha", cmd_captcha))
     app.add_handler(CommandHandler("captchainfo", cmd_captchainfo))
     app.add_handler(conv)
+    app.add_handler(cc_conv)  # must be BEFORE generic on_callback
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     print("🎵 Spotify Bot စတင်နေပါပြီ...")
     print(f"👑 Admins: {ADMIN_IDS if ADMIN_IDS != [0] else '⚠️  ADMIN_IDS env var မထည့်ရသေးပါ!'}")
